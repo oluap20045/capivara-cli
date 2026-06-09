@@ -404,6 +404,33 @@ def cmd_new(state):
 
 # ─── Info Commands ───────────────────────────────────────────────────────────
 
+def _get_active_iface():
+    """Returns (iface, local_ip, gateway, subnet_cidr) from default route."""
+    route = _run(["ip", "route", "show", "default"])
+    iface = re.search(r'dev (\S+)', route)
+    gw    = re.search(r'via (\S+)', route)
+    iface = iface.group(1) if iface else None
+    gw    = gw.group(1) if gw else None
+    if not iface:
+        return None, None, None, None
+    try:
+        ip_json = _run(["ip", "-j", "addr", "show", iface])
+        data = json.loads(ip_json)
+        for entry in data:
+            for addr in entry.get("addr_info", []):
+                if addr.get("family") == "inet":
+                    local_ip = addr["local"]
+                    prefix   = addr["prefixlen"]
+                    # Build subnet CIDR
+                    parts = [int(x) for x in local_ip.split(".")]
+                    mask  = (0xFFFFFFFF << (32 - prefix)) & 0xFFFFFFFF
+                    net   = ".".join(str((parts[i] & ((mask >> (8*(3-i))) & 0xFF))) for i in range(4))
+                    subnet = f"{net}/{prefix}"
+                    return iface, local_ip, gw, subnet
+    except Exception:
+        pass
+    return iface, None, gw, None
+
 def _run(cmd, timeout=5):
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -733,6 +760,157 @@ def cmd_hacker(_state=None):
             print(re.sub(r'\[.*?\]', '', l))
 
 
+def cmd_scan(_state=None):
+    from collections import defaultdict
+
+    lines  = []
+    risks  = []   # (level, msg)  level: "low"|"medium"|"high"|"critical"
+
+    iface, local_ip, gateway, subnet = _get_active_iface()
+
+    if not iface:
+        msg = "Não foi possível detectar interface ativa."
+        if RICH: console.print(f"[red]{msg}[/red]")
+        else: print(msg)
+        return
+
+    lines.append(f"[bold]Interface:[/bold] {iface}  IP: [cyan]{local_ip}[/cyan]  Gateway: [cyan]{gateway}[/cyan]")
+    lines.append(f"[bold]Subnet:[/bold]    {subnet}")
+    lines.append("")
+
+    # ── 1. Host discovery (nmap -sn) ─────────────────────────────────────────
+    if not shutil.which("nmap"):
+        lines.append("[yellow]⚠  nmap não instalado (pacman -S nmap)[/yellow]")
+        risks.append(("low", "nmap ausente — instale para scans completos"))
+    else:
+        if RICH: console.print(f"[dim]🔍 Descobrindo hosts em {subnet} …[/dim]", end="")
+        nmap_hosts = _run(["nmap", "-sn", "--min-rate", "1000", "-T4", subnet], timeout=45)
+        if RICH: console.print("\r" + " " * 50 + "\r", end="")
+
+        hosts = re.findall(r'Nmap scan report for (.+)', nmap_hosts)
+        macs  = re.findall(r'MAC Address: ([0-9A-F:]{17})(?: \((.+?)\))?', nmap_hosts)
+
+        lines.append(f"[bold]🖥️  Hosts descobertos ({len(hosts)}):[/bold]")
+        vendor_map = {}
+        for i, host in enumerate(hosts):
+            mac, vendor = (macs[i-1] if i > 0 and i-1 < len(macs) else ("?", ""))
+            vendor_map[host] = vendor
+            is_gw = gateway and (gateway in host or host == gateway)
+            label = " [yellow](gateway)[/yellow]" if is_gw else ""
+            lines.append(f"  {'🌐' if is_gw else '💻'} {host}  [dim]{mac}  {vendor}[/dim]{label}")
+
+        if len(hosts) > 20:
+            risks.append(("medium", f"{len(hosts)} hosts na rede — rede muito populada (hotel/coworking?)"))
+        elif len(hosts) > 50:
+            risks.append(("high", f"{len(hosts)} hosts — alto risco em rede pública"))
+
+        # ── 2. Gateway port scan (nmap -F) ────────────────────────────────────
+        if gateway:
+            if RICH: console.print(f"[dim]🔍 Escaneando gateway {gateway} …[/dim]", end="")
+            gw_scan = _run(["nmap", "-F", "--open", "-T4", gateway], timeout=30)
+            if RICH: console.print("\r" + " " * 50 + "\r", end="")
+
+            gw_ports = re.findall(r'(\d+)/tcp\s+open\s+(\S+)', gw_scan)
+            suspicious_gw = {"23", "21", "8080", "8443", "9090", "4444", "1234"}
+
+            lines.append(f"\n[bold]🌐 Gateway {gateway} — portas abertas:[/bold]")
+            if gw_ports:
+                for port, svc in gw_ports:
+                    flag = " [red]⚠ SUSPEITO[/red]" if port in suspicious_gw else ""
+                    lines.append(f"  :{port}  {svc}{flag}")
+                    if port in suspicious_gw:
+                        risks.append(("high", f"Gateway expõe porta suspeita :{port} ({svc})"))
+                if len(gw_ports) > 5:
+                    risks.append(("medium", f"Gateway com {len(gw_ports)} portas abertas — roteador mal configurado"))
+            else:
+                lines.append("  [green]✓ Nenhuma porta aberta detectada[/green]")
+
+    # ── 3. ARP spoofing detection (tshark) ───────────────────────────────────
+    lines.append("")
+    tshark_bin = shutil.which("tshark") or shutil.which("dumpcap")
+    if not tshark_bin:
+        lines.append("[yellow]⚠  tshark não instalado (pacman -S wireshark-cli)[/yellow]")
+        risks.append(("low", "tshark ausente — instale para detecção ARP spoofing"))
+    else:
+        secs = 8
+        if RICH: console.print(f"[dim]📡 Capturando tráfego ARP por {secs}s …[/dim]", end="")
+        # Captura ARP: ip src, mac src, opcode (1=request, 2=reply)
+        tshark_out = _run([
+            "tshark", "-i", iface, "-a", f"duration:{secs}",
+            "-Y", "arp", "-T", "fields",
+            "-e", "arp.src.proto_ipv4",
+            "-e", "arp.src.hw_mac",
+            "-e", "arp.opcode",
+            "-E", "separator=|",
+        ], timeout=secs + 5)
+        if RICH: console.print("\r" + " " * 50 + "\r", end="")
+
+        ip_to_macs  = defaultdict(set)
+        arp_replies = 0
+        arp_counts  = defaultdict(int)
+
+        for row in tshark_out.splitlines():
+            parts = row.split("|")
+            if len(parts) < 3:
+                continue
+            src_ip, src_mac, opcode = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            if src_ip and src_mac:
+                ip_to_macs[src_ip].add(src_mac)
+            if opcode == "2":
+                arp_replies += 1
+                arp_counts[src_ip] += 1
+
+        spoofed = {ip: macs for ip, macs in ip_to_macs.items() if len(macs) > 1}
+
+        lines.append(f"[bold]📡 Análise ARP ({secs}s):[/bold]")
+        lines.append(f"  Replies capturados: {arp_replies}")
+        lines.append(f"  IPs únicos vistos:  {len(ip_to_macs)}")
+
+        # ARP storm detection
+        for ip, count in arp_counts.items():
+            if count > 20:
+                lines.append(f"  [red]⚡ ARP STORM: {ip} enviou {count} replies![/red]")
+                risks.append(("critical", f"ARP storm detectado de {ip} — possível ataque"))
+
+        # ARP spoofing detection
+        if spoofed:
+            lines.append(f"\n  [bold red]🚨 ARP SPOOFING DETECTADO![/bold red]")
+            for ip, macs in spoofed.items():
+                is_gw = gateway and ip == gateway
+                tag = " [red](GATEWAY!)[/red]" if is_gw else ""
+                lines.append(f"  [red]  {ip} → {', '.join(macs)}{tag}[/red]")
+                severity = "critical" if is_gw else "high"
+                risks.append((severity, f"ARP spoofing: {ip} tem {len(macs)} MACs diferentes — possível MITM"))
+        else:
+            lines.append("  [green]✓ Sem ARP spoofing detectado[/green]")
+
+        # Verifica se gateway tem MAC consistente com o que vimos no nmap
+        if gateway and gateway in ip_to_macs and len(ip_to_macs[gateway]) == 1:
+            lines.append(f"  [green]✓ Gateway {gateway} MAC consistente[/green]")
+
+    # ── 4. Risk summary ───────────────────────────────────────────────────────
+    lines.append("")
+    if not risks:
+        lines.append("[bold green]✅ REDE SEGURA — nenhum risco detectado[/bold green]")
+    else:
+        order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        risks.sort(key=lambda x: order.get(x[0], 9))
+        color_map = {"critical": "red", "high": "orange3", "medium": "yellow", "low": "dim"}
+        icon_map  = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}
+        lines.append("[bold]⚠️  Riscos detectados:[/bold]")
+        for level, msg in risks:
+            c = color_map.get(level, "white")
+            i = icon_map.get(level, "•")
+            lines.append(f"  {i} [{c}]{level.upper()}[/{c}]  {msg}")
+
+    if RICH:
+        from rich.panel import Panel
+        console.print(Panel("\n".join(lines), title="[bold red]🔬 CapivaraScan[/bold red]", border_style="red"))
+    else:
+        for l in lines:
+            print(re.sub(r'\[.*?\]', '', l))
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -750,7 +928,7 @@ def main():
     )
     parser.add_argument("command", nargs="?", default="greet",
                         choices=["greet", "status", "food", "pet", "talk", "new",
-                                 "clima", "tech", "net", "hacker"])
+                                 "clima", "tech", "net", "hacker", "scan"])
     parser.add_argument("--name", default="Capivara")
     parser.add_argument("--model", default=OLLAMA_MODEL)
 
@@ -793,6 +971,7 @@ def main():
         "tech":   cmd_tech,
         "net":    cmd_net,
         "hacker": cmd_hacker,
+        "scan":   cmd_scan,
     }
 
     if args.command in dispatch:
