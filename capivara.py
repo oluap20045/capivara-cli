@@ -6,6 +6,9 @@ import os
 import sys
 import argparse
 import random
+import re
+import shutil
+import subprocess
 import threading
 import time
 import urllib.request
@@ -399,6 +402,337 @@ def cmd_new(state):
     return True
 
 
+# ─── Info Commands ───────────────────────────────────────────────────────────
+
+def _run(cmd, timeout=5):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def cmd_clima(_state=None):
+    try:
+        req = urllib.request.Request(
+            "http://wttr.in/?format=j1",
+            headers={"User-Agent": "curl/7.0"}
+        )
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            data = json.loads(resp.read())
+        cur = data["current_condition"][0]
+        area = data.get("nearest_area", [{}])[0]
+        city = area.get("areaName", [{}])[0].get("value", "?")
+        country = area.get("country", [{}])[0].get("value", "")
+
+        temp     = cur["temp_C"]
+        feels    = cur["FeelsLikeC"]
+        desc     = cur["weatherDesc"][0]["value"]
+        humidity = cur["humidity"]
+        wind     = cur["windspeedKmph"]
+        vis      = cur["visibility"]
+
+        weather_icon = {
+            "Sunny": "☀️", "Clear": "🌙", "Partly cloudy": "⛅",
+            "Cloudy": "☁️", "Overcast": "☁️", "Mist": "🌫️",
+            "Rain": "🌧️", "Drizzle": "🌦️", "Thunder": "⛈️",
+            "Snow": "❄️", "Fog": "🌫️", "Blizzard": "🌨️",
+        }.get(desc, "🌡️")
+
+        lines = [
+            f"[bold]{weather_icon} {desc}[/bold]   {city}, {country}",
+            "",
+            f"🌡️  Temperatura:  [cyan]{temp}°C[/cyan]  (sensação {feels}°C)",
+            f"💧 Humidade:     [blue]{humidity}%[/blue]",
+            f"💨 Vento:        [green]{wind} km/h[/green]",
+            f"👁️  Visibilidade: {vis} km",
+        ]
+        # 3-day forecast
+        try:
+            days = data.get("weather", [])[:3]
+            lines.append("")
+            lines.append("[bold]Próximos 3 dias:[/bold]")
+            for d in days:
+                date = d["date"]
+                mn = d["mintempC"]
+                mx = d["maxtempC"]
+                ddesc = d["hourly"][4]["weatherDesc"][0]["value"]
+                lines.append(f"  {date}  {mn}°↑{mx}°  {ddesc}")
+        except Exception:
+            pass
+
+        if RICH:
+            from rich.panel import Panel
+            console.print(Panel("\n".join(lines), title="[bold cyan]🌦️  CapivaraClima[/bold cyan]", border_style="cyan"))
+        else:
+            for l in lines:
+                print(re.sub(r'\[.*?\]', '', l))
+
+    except Exception as e:
+        msg = f"Sem conexão ou wttr.in fora do ar. ({e})"
+        if RICH: console.print(f"[red]{msg}[/red]")
+        else: print(msg)
+
+
+def cmd_tech(_state=None):
+    lines = []
+
+    # CPU load
+    try:
+        load = Path("/proc/loadavg").read_text().split()
+        l1, l5, l15 = load[0], load[1], load[2]
+        cores = os.cpu_count() or 1
+        pct = float(l1) / cores * 100
+        color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
+        lines.append(f"[bold]CPU[/bold]  load {l1} / {l5} / {l15}  [{color}]{pct:.0f}%[/{color}] ({cores} cores)")
+    except Exception:
+        lines.append("CPU  n/a")
+
+    # RAM
+    try:
+        mem = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, v = line.split(":", 1)
+            mem[k.strip()] = int(v.strip().split()[0])
+        total = mem["MemTotal"] // 1024
+        avail = mem["MemAvailable"] // 1024
+        used  = total - avail
+        pct   = used / total * 100
+        color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
+        lines.append(f"[bold]RAM[/bold]  {used} / {total} MB  [{color}]{pct:.0f}%[/{color}]")
+    except Exception:
+        lines.append("RAM  n/a")
+
+    # Disk
+    try:
+        usage = shutil.disk_usage("/")
+        total = usage.total // (1024**3)
+        used  = usage.used  // (1024**3)
+        pct   = usage.used / usage.total * 100
+        color = "green" if pct < 70 else "yellow" if pct < 90 else "red"
+        lines.append(f"[bold]Disk[/bold] {used} / {total} GB  [{color}]{pct:.0f}%[/{color}]")
+    except Exception:
+        lines.append("Disk n/a")
+
+    # GPU (nvidia-smi)
+    gpu_out = _run(["nvidia-smi", "--query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total",
+                    "--format=csv,noheader,nounits"], timeout=4)
+    if gpu_out:
+        for row in gpu_out.splitlines():
+            parts = [p.strip() for p in row.split(",")]
+            if len(parts) >= 5:
+                name, temp, util, mem_used, mem_total = parts[:5]
+                color = "green" if int(util) < 60 else "yellow" if int(util) < 85 else "red"
+                lines.append(f"[bold]GPU[/bold]  {name}  🌡️{temp}°C  [{color}]{util}%[/{color}]  {mem_used}/{mem_total} MB")
+
+    # Docker
+    docker_out = _run(["docker", "ps", "--format", "{{.Names}}\t{{.Status}}\t{{.Image}}"], timeout=5)
+    if docker_out:
+        lines.append("")
+        lines.append("[bold]🐳 Docker containers:[/bold]")
+        for row in docker_out.splitlines():
+            parts = row.split("\t")
+            if len(parts) >= 3:
+                name, status, image = parts[0], parts[1], parts[2]
+                up = status.startswith("Up")
+                icon = "🟢" if up else "🔴"
+                lines.append(f"  {icon} [bold]{name}[/bold]  {status}  [dim]{image}[/dim]")
+    else:
+        lines.append("[dim]Docker: sem containers rodando (ou não instalado)[/dim]")
+
+    if RICH:
+        from rich.panel import Panel
+        console.print(Panel("\n".join(lines), title="[bold green]🖥️  CapivaraTech[/bold green]", border_style="green"))
+    else:
+        for l in lines:
+            print(re.sub(r'\[.*?\]', '', l))
+
+
+def cmd_net(_state=None):
+    lines = []
+
+    # Interfaces + VPN detection
+    vpn_ifaces = []
+    try:
+        ip_json = _run(["ip", "-j", "addr"])
+        ifaces = json.loads(ip_json) if ip_json else []
+        vpn_keywords = {"tun", "wg", "vpn", "ppp", "tap", "nordlynx", "proton"}
+        skip_prefixes = {"veth", "br-"}  # Docker internals — mostrar só contagem
+        lines.append("[bold]Interfaces:[/bold]")
+        veth_count = 0
+        for iface in ifaces:
+            name  = iface.get("ifname", "")
+            state = iface.get("operstate", "")
+            addrs = [a["local"] for a in iface.get("addr_info", []) if "local" in a]
+            if any(name.startswith(p) for p in skip_prefixes):
+                veth_count += 1
+                continue
+            if state == "UNKNOWN" and not addrs:
+                continue
+            is_vpn = any(kw in name.lower() for kw in vpn_keywords)
+            if is_vpn:
+                vpn_ifaces.append(name)
+            icon = "🔐" if is_vpn else ("🟢" if state == "UP" else "⚪")
+            addr_str = "  ".join(addrs) if addrs else "sem IP"
+            color = "magenta" if is_vpn else ("green" if state == "UP" else "dim")
+            lines.append(f"  {icon} [{color}]{name}[/{color}]  {addr_str}")
+        if veth_count:
+            lines.append(f"  [dim]+ {veth_count} interfaces Docker (veth/br) ocultas[/dim]")
+    except Exception:
+        lines.append("  Interfaces: n/a")
+
+    # VPN status summary
+    if vpn_ifaces:
+        lines.append(f"\n[bold magenta]🔐 VPN ATIVA:[/bold magenta] {', '.join(vpn_ifaces)}")
+    else:
+        lines.append("\n[dim]VPN: não detectada[/dim]")
+
+    # Default gateway
+    gw = _run(["ip", "route", "show", "default"])
+    if gw:
+        lines.append(f"[bold]Gateway:[/bold] {gw.splitlines()[0]}")
+
+    # Public IP (com timeout curto)
+    lines.append("")
+    try:
+        req = urllib.request.Request("https://ifconfig.me", headers={"User-Agent": "curl/7.0"})
+        with urllib.request.urlopen(req, timeout=4) as resp:
+            pub_ip = resp.read().decode().strip()
+        lines.append(f"[bold]IP Público:[/bold]  [cyan]{pub_ip}[/cyan]")
+    except Exception:
+        lines.append("[bold]IP Público:[/bold]  [dim]timeout[/dim]")
+
+    # DNS
+    try:
+        resolv = Path("/etc/resolv.conf").read_text()
+        dns = [l.split()[1] for l in resolv.splitlines() if l.startswith("nameserver")]
+        lines.append(f"[bold]DNS:[/bold]         {', '.join(dns)}")
+    except Exception:
+        pass
+
+    # Ping google
+    ping = _run(["ping", "-c", "1", "-W", "2", "8.8.8.8"], timeout=4)
+    if "time=" in ping:
+        ms = re.search(r"time=([\d.]+)", ping)
+        latency = ms.group(1) if ms else "?"
+        lines.append(f"[bold]Latência:[/bold]    [green]{latency} ms[/green] (8.8.8.8)")
+    else:
+        lines.append("[bold]Latência:[/bold]    [red]sem resposta[/red]")
+
+    if RICH:
+        from rich.panel import Panel
+        console.print(Panel("\n".join(lines), title="[bold blue]🌐 CapivaraNet[/bold blue]", border_style="blue"))
+    else:
+        for l in lines:
+            print(re.sub(r'\[.*?\]', '', l))
+
+
+def cmd_hacker(_state=None):
+    lines = []
+
+    # Portas abertas (ss -tlnp)
+    ss_out = _run(["ss", "-tlnp"])
+    if ss_out:
+        seen = {}
+        for row in ss_out.splitlines()[1:]:
+            parts = row.split()
+            if len(parts) >= 4:
+                local = parts[3]
+                proc  = parts[6] if len(parts) > 6 else ""
+                port  = local.rsplit(":", 1)[-1] if ":" in local else local
+                if not port.isdigit():
+                    continue
+                name = re.search(r'\"(.+?)\"', proc)
+                pname = name.group(1) if name else "?"
+                if port not in seen:
+                    seen[port] = pname
+        ports = list(seen.items())
+        lines.append(f"[bold]🔌 Portas abertas ({len(ports)}):[/bold]")
+        known_ports = {
+            "22": "SSH", "80": "HTTP", "443": "HTTPS", "3306": "MySQL",
+            "5432": "PostgreSQL", "6379": "Redis", "8080": "HTTP-alt",
+            "8089": "API", "9000": "Portainer", "11434": "Ollama",
+            "27017": "MongoDB", "7200": "GraphDB", "5180": "UI",
+            "3001": "Node", "631": "CUPS",
+        }
+        for port, name in sorted(ports, key=lambda x: int(x[0])):
+            known = known_ports.get(port, "")
+            label = f"[dim]{known}[/dim]" if known else ""
+            lines.append(f"  :{port}  {name}  {label}")
+    else:
+        lines.append("[dim]ss não disponível[/dim]")
+
+    # SUID binários não-padrão
+    lines.append("")
+    suid_out = _run(["find", "/usr/bin", "/usr/local/bin", "-perm", "-4000", "-type", "f"], timeout=8)
+    expected_suid = {
+        "sudo", "su", "passwd", "newgrp", "chsh", "chfn", "gpasswd", "mount", "umount",
+        "pkexec", "unix_chkpwd", "chage", "expiry", "sg", "fusermount", "fusermount3",
+        "mount.cifs", "crontab", "ksu", "nvidia-modprobe", "Xorg", "dbus-daemon-launch-helper",
+        "pam_timestamp_check", "at", "ssh-keysign", "ping",
+    }
+    if suid_out:
+        suids = suid_out.splitlines()
+        unusual = [s for s in suids if Path(s).name not in expected_suid]
+        lines.append(f"[bold]🔑 SUID binários:[/bold] {len(suids)} encontrados")
+        if unusual:
+            for u in unusual:
+                lines.append(f"  [yellow]⚠️  {u}[/yellow]")
+        else:
+            lines.append("  [green]✓ Nenhum incomum[/green]")
+
+    # SSH falhas recentes
+    lines.append("")
+    ssh_fails = _run(["journalctl", "-u", "sshd", "--no-pager", "-n", "100",
+                      "--since", "24 hours ago"], timeout=5)
+    if ssh_fails:
+        fail_lines = [l for l in ssh_fails.splitlines() if "Failed" in l or "Invalid" in l]
+        ips = re.findall(r'from (\d+\.\d+\.\d+\.\d+)', " ".join(fail_lines))
+        from collections import Counter
+        top = Counter(ips).most_common(5)
+        lines.append(f"[bold]🚨 SSH falhas (24h):[/bold] {len(fail_lines)} tentativas")
+        if top:
+            for ip, count in top:
+                lines.append(f"  [red]{ip}[/red]  {count}x")
+        else:
+            lines.append("  [green]✓ Nenhuma[/green]")
+    else:
+        lines.append("[bold]🚨 SSH falhas:[/bold]  [green]✓ Nenhuma / sshd inativo[/green]")
+
+    # Firewall
+    lines.append("")
+    ufw = _run(["ufw", "status"], timeout=3)
+    if ufw:
+        status = "ativo" if "active" in ufw.lower() else "inativo"
+        color = "green" if status == "ativo" else "red"
+        lines.append(f"[bold]🛡️  Firewall (ufw):[/bold] [{color}]{status}[/{color}]")
+    else:
+        # Tenta iptables
+        ipt = _run(["iptables", "-L", "INPUT", "--line-numbers", "-n"], timeout=3)
+        if ipt:
+            rules = len([l for l in ipt.splitlines() if l[0].isdigit()])
+            lines.append(f"[bold]🛡️  iptables INPUT:[/bold] {rules} regras")
+        else:
+            lines.append("[bold]🛡️  Firewall:[/bold] [dim]não detectado[/dim]")
+
+    # World-writable em /etc
+    ww = _run(["find", "/etc", "-maxdepth", "2", "-writable", "-not", "-user", "root",
+               "-not", "-type", "l"], timeout=6)
+    if ww:
+        lines.append(f"\n[bold]⚠️  Arquivos /etc graváveis por não-root:[/bold]")
+        for f in ww.splitlines()[:5]:
+            lines.append(f"  [red]{f}[/red]")
+    else:
+        lines.append("\n[bold]/etc gravável:[/bold] [green]✓ Limpo[/green]")
+
+    if RICH:
+        from rich.panel import Panel
+        console.print(Panel("\n".join(lines), title="[bold red]🕵️  CapivaraHacker[/bold red]", border_style="red"))
+    else:
+        for l in lines:
+            print(re.sub(r'\[.*?\]', '', l))
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -415,7 +749,8 @@ def main():
   new       criar nova capivara"""
     )
     parser.add_argument("command", nargs="?", default="greet",
-                        choices=["greet", "status", "food", "pet", "talk", "new"])
+                        choices=["greet", "status", "food", "pet", "talk", "new",
+                                 "clima", "tech", "net", "hacker"])
     parser.add_argument("--name", default="Capivara")
     parser.add_argument("--model", default=OLLAMA_MODEL)
 
@@ -454,6 +789,10 @@ def main():
         "food":   cmd_feed,
         "pet":    cmd_pet,
         "talk":   cmd_talk,
+        "clima":  cmd_clima,
+        "tech":   cmd_tech,
+        "net":    cmd_net,
+        "hacker": cmd_hacker,
     }
 
     if args.command in dispatch:
