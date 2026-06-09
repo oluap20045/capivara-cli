@@ -911,6 +911,56 @@ def cmd_scan(_state=None):
             print(re.sub(r'\[.*?\]', '', l))
 
 
+COMMANDS = [
+    # (name, emoji, category, description)
+    # ── Tamagotchi ──
+    ("greet",  "👋", "tamagotchi", "Saudação rápida ao abrir terminal (instantâneo via cache)"),
+    ("status", "📊", "tamagotchi", "Painel completo: ASCII art, stats, nível, XP"),
+    ("food",   "🌿", "tamagotchi", "Alimentar a capivara (+fome +XP)"),
+    ("pet",    "💛", "tamagotchi", "Dar carinho (+felicidade +XP)"),
+    ("talk",   "💬", "tamagotchi", "Conversar via Ollama (llama3.1:8b)"),
+    ("new",    "✨", "tamagotchi", "Criar nova capivara (apaga estado atual)"),
+    # ── Info ──
+    ("clima",  "🌦️", "info",       "Clima atual + forecast 3 dias (wttr.in, localização por IP)"),
+    ("tech",   "🖥️", "info",       "CPU / RAM / Disk / GPU + containers Docker"),
+    ("net",    "🌐", "info",       "Interfaces, VPN, IP público, DNS, latência"),
+    ("hacker", "🕵️", "info",       "Portas abertas, SUID, falhas SSH, firewall, /etc gravável"),
+    ("scan",   "🔬", "info",       "Scan de rede: hosts, gateway, ARP spoofing (nmap + tshark)"),
+    # ── Meta ──
+    ("help",   "❓", "meta",       "Este menu"),
+]
+
+
+def cmd_help(_state=None):
+    if RICH:
+        from rich.panel import Panel
+        from rich.table import Table
+
+        table = Table(show_header=True, header_style="bold", box=None, padding=(0, 2))
+        table.add_column("Comando",     style="bold cyan",  no_wrap=True)
+        table.add_column("",            no_wrap=True)
+        table.add_column("Descrição",   style="white")
+
+        current_cat = None
+        for name, emoji, cat, desc in COMMANDS:
+            if cat != current_cat:
+                current_cat = cat
+                label = {"tamagotchi": "🐾 Tamagotchi", "info": "📡 Info", "meta": "⚙️  Meta"}[cat]
+                table.add_row("", "", f"[dim]{label}[/dim]")
+            table.add_row(f"capivara {name}", emoji, desc)
+
+        console.print(Panel(table, title="[bold green]🐾 CapivaraCLI — Comandos[/bold green]", border_style="green"))
+    else:
+        print("\n=== CapivaraCLI — Comandos ===\n")
+        current_cat = None
+        for name, emoji, cat, desc in COMMANDS:
+            if cat != current_cat:
+                current_cat = cat
+                print(f"\n[{cat.upper()}]")
+            print(f"  capivara {name:<10} {emoji}  {desc}")
+        print()
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
@@ -928,7 +978,7 @@ def main():
     )
     parser.add_argument("command", nargs="?", default="greet",
                         choices=["greet", "status", "food", "pet", "talk", "new",
-                                 "clima", "tech", "net", "hacker", "scan"])
+                                 "clima", "tech", "net", "hacker", "scan", "help"])
     parser.add_argument("--name", default="Capivara")
     parser.add_argument("--model", default=OLLAMA_MODEL)
 
@@ -972,6 +1022,7 @@ def main():
         "net":    cmd_net,
         "hacker": cmd_hacker,
         "scan":   cmd_scan,
+        "help":   cmd_help,
     }
 
     if args.command in dispatch:
