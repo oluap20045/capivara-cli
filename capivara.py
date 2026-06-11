@@ -13,7 +13,7 @@ import threading
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 CAPIVARA_DIR = Path.home() / ".capivara"
@@ -141,6 +141,22 @@ def new_capivara(name="Capivara"):
     }
 
 
+def _energy_delta(last, now):
+    """Percorre o intervalo hora a hora: noite (22h-6h) recupera 2x, dia drena."""
+    delta = 0.0
+    t = last
+    while t < now:
+        boundary = t.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+        step_end = min(boundary, now)
+        frac = (step_end - t).total_seconds() / 3600
+        if t.hour >= 22 or t.hour < 6:
+            delta += DECAY_PER_HOUR["energy"] * 2 * frac
+        else:
+            delta -= DECAY_PER_HOUR["energy"] * frac
+        t = step_end
+    return delta
+
+
 def apply_decay(state):
     last = datetime.fromisoformat(state["last_seen"])
     now = datetime.now()
@@ -149,11 +165,9 @@ def apply_decay(state):
     state["hunger"] = max(0, state["hunger"] - DECAY_PER_HOUR["hunger"] * hours)
     state["happiness"] = max(0, state["happiness"] - DECAY_PER_HOUR["happiness"] * hours)
 
-    # Energia: recupera à noite (22h-6h), decai durante o dia
-    if 22 <= now.hour or now.hour < 6:
-        state["energy"] = min(100, state["energy"] + DECAY_PER_HOUR["energy"] * hours * 2)
-    else:
-        state["energy"] = max(0, state["energy"] - DECAY_PER_HOUR["energy"] * hours)
+    # Energia: noite (22h-6h) recupera, dia drena — contado hora a hora,
+    # não pela hora atual (senão a noite inteira era ignorada)
+    state["energy"] = max(0, min(100, state["energy"] + _energy_delta(last, now)))
 
     state["last_seen"] = now.isoformat()
     born = datetime.fromisoformat(state["born"])
