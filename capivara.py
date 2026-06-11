@@ -254,6 +254,7 @@ def capivara_speak(state, context="greeting", user_msg=None, spin=True):
         "hungry":   f"{base} Você está com muita fome (fome={state['hunger']:.0f}/100). Reclame fofamente.",
         "feed":     f"{base} Você acabou de comer grama e está feliz. Reaja com alegria.",
         "pet":      f"{base} Você está recebendo carinho. Reaja com carinho.",
+        "coffee":   f"{base} Você acabou de tomar um cafezinho e está cheia de energia, coisa rara para uma capivara. Reaja elétrica e animada.",
         "talk":     f"{base} O usuário disse: '{user_msg}'. Responda na personalidade de capivara.",
         "levelup":  f"{base} Você acabou de subir de nível! Comemore.",
     }
@@ -263,6 +264,7 @@ def capivara_speak(state, context="greeting", user_msg=None, spin=True):
         "hungry":   "Tô com fomeee...",
         "feed":     "Nhaaaam! Grama boa!",
         "pet":      "Purrrr... ♡",
+        "coffee":   "☕ Oink!! Energia turbinada!",
         "talk":     "... (pensando na grama)",
         "levelup":  "★ Evoluí! Mais grama pra mim!",
     }
@@ -379,6 +381,20 @@ def cmd_pet(state):
         console.print(f"[magenta]{mini}[/magenta] [italic]{speech}[/italic]  [dim](+20 felicidade, +5 XP)[/dim]")
     else:
         print(f"{mini} {speech}  (+20 felicidade, +5 XP)")
+    check_levelup(state)
+
+
+def cmd_coffee(state):
+    gain = random.randint(25, 40)
+    state["energy"] = min(100, state["energy"] + gain)
+    state["happiness"] = min(100, state["happiness"] + 5)
+    state["xp"] += 5
+    speech = capivara_speak(state, "coffee")
+    print_speech(state, speech)
+    if RICH:
+        console.print(f"[dim](+{gain} energia, +5 felicidade, +5 XP)[/dim]")
+    else:
+        print(f"(+{gain} energia, +5 felicidade, +5 XP)")
     check_levelup(state)
 
 
@@ -932,6 +948,7 @@ COMMANDS = [
     ("status", "📊", "tamagotchi", "Painel completo: ASCII art, stats, nível, XP"),
     ("food",   "🌿", "tamagotchi", "Alimentar a capivara (+fome +XP)"),
     ("pet",    "💛", "tamagotchi", "Dar carinho (+felicidade +XP)"),
+    ("cafe",   "☕", "tamagotchi", "Dar café (+energia +XP)"),
     ("talk",   "💬", "tamagotchi", "Conversar via Ollama (llama3.1:8b)"),
     ("new",    "✨", "tamagotchi", "Criar nova capivara (apaga estado atual)"),
     # ── Info ──
@@ -987,11 +1004,12 @@ def main():
   status    estatísticas completas com ASCII art
   food      alimentar (+fome +xp)
   pet       dar carinho (+felicidade +xp)
+  cafe      dar café (+energia +xp)
   talk      conversar via Ollama
   new       criar nova capivara"""
     )
     parser.add_argument("command", nargs="?", default="greet",
-                        choices=["greet", "status", "food", "pet", "talk", "new",
+                        choices=["greet", "status", "food", "pet", "cafe", "talk", "new",
                                  "clima", "tech", "net", "hacker", "scan", "help"])
     parser.add_argument("--name", default="Capivara")
     parser.add_argument("--model", default=OLLAMA_MODEL)
@@ -1030,6 +1048,7 @@ def main():
         "status": cmd_status,
         "food":   cmd_feed,
         "pet":    cmd_pet,
+        "cafe":   cmd_coffee,
         "talk":   cmd_talk,
         "clima":  cmd_clima,
         "tech":   cmd_tech,
