@@ -30,32 +30,37 @@ STAGES = [(0, "filhote"), (7, "jovem"), (30, "adulto"), (180, "anciao")]
 
 ASCII_ARTS = {
     "filhote": """\
-    .-.
-   (o o)    filhote
-    \\_/
-    /\\
-   /  \\""",
+    n   n
+   (ᵔ ᴥ ᵔ)   filhote
+  /        \\
+ ( ________ )
+   u      u""",
 
     "jovem": """\
-   .--.
-  (o  o)    jovem
-   \\__/
-  /|  |\\
-  U    U""",
+    n    n
+   ( •ᴥ• )   jovem
+  /         \\
+ |           |
+ ( _________ )
+   u       u""",
 
     "adulto": """\
-  .------.
- ( o    o )  adulto
-  \\  ᵕᵕ /
-  /|    |\\
-  U      U""",
+     n     n
+    ( ᵔ ᴥ ᵔ )   adulto
+   /          \\
+  |            |
+  |            |
+  ( __________ )
+    u   u    u""",
 
     "anciao": """\
-  .-------.
- ( ©    © )  ancião
-  \\  ω   /   ~sábio
-  /|     |\\
-  U       U""",
+      n      n
+     ( ◕ ᴥ ◕ )   ancião
+    /  ~sábio  \\
+   |            |
+   |            |
+   ( __________ )
+     u   u    u""",
 }
 
 MINI_ART = {
