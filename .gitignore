@@ -2,3 +2,6 @@ state.json
 greeting_cache.txt
 prompt_cache.txt
 xp_pending.txt
+cmd_pending.txt
+__pycache__/
+*.pyc

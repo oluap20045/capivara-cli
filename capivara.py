@@ -157,37 +157,132 @@ def _energy_delta(last, now):
     return delta
 
 
+# Configuração de Skills
+SKILL_MAP = {
+    "pdflatex": "LaTeX", "latex": "LaTeX", "bibtex": "LaTeX", "tectonic": "LaTeX",
+    "nano": "Editor", "vim": "Editor", "nvim": "Editor", "vi": "Editor", "emacs": "Editor", "code": "Editor",
+    "claude": "AI", "claude-local": "AI", "claude-qwen": "AI", "claude-deepseek": "AI",
+    "gemini": "AI", "ollama": "AI",
+    "git": "DevOps", "docker": "DevOps", "docker-compose": "DevOps", "kubectl": "DevOps",
+    "python": "Programador", "python3": "Programador", "node": "Programador", "npm": "Programador", "go": "Programador", "rustc": "Programador", "cargo": "Programador",
+    "ssh": "Network", "scp": "Network", "nmap": "Network", "curl": "Network", "wget": "Network"
+}
+
+SKILL_TITLES = {
+    "LaTeX":       ["Iniciante em TeX", "Diagramador", "Mestre do Overleaf", "Lorde do PDF"],
+    "Editor":      ["Usuário de Notepad", "Escritor de Código", "Ninja do Atalho", "Vim Sorcerer"],
+    "AI":          ["Prompt Explorer", "Sussurrador de LLMs", "Engenheiro de Contexto", "Arquiteto de Redes"],
+    "DevOps":      ["Deployer Junior", "Committer", "Lorde do Docker", "Orquestrador de Nuvem"],
+    "Programador": ["Script Kiddie", "Dev", "Software Architect", "Full-Stack God"],
+    "Network":     ["Pingador", "Sysadmin", "Ghost in the Shell", "Netrunner"],
+}
+
+SKILL_EMOJIS = {
+    "LaTeX": "📄", "Editor": "✍️", "AI": "🤖", "DevOps": "📦", "Programador": "💻", "Network": "🌐"
+}
+
+CMD_PENDING = CAPIVARA_DIR / "cmd_pending.txt"
+
+def get_skill_title_and_emoji(state):
+    skills = state.get("skills", {})
+    if not skills:
+        return "Capivara Curiosa", ""
+
+    # Pega a skill com maior nível (e maior XP como desempate)
+    top_skill = max(skills.items(), key=lambda x: (x[1]["level"], x[1]["xp"]))
+    name, data = top_skill
+    lvl = data["level"]
+    
+    # Define o índice do título (até o nível 4+)
+    idx = min(len(SKILL_TITLES.get(name, [""])) - 1, lvl - 1)
+    title = SKILL_TITLES.get(name, ["Mestre"])[idx]
+    emoji = SKILL_EMOJIS.get(name, "🐾")
+    
+    return title, emoji
+
+def _regen_greeting_cache(state):
+    stage = get_stage(state.get("age_days", 0))
+    mini = MINI_ART[stage]
+    mood, emoji = get_mood(state)
+    
+    # Se tiver uma skill dominante, usa o emoji dela no prompt
+    _, skill_emoji = get_skill_title_and_emoji(state)
+    if skill_emoji:
+        emoji = skill_emoji
+
+    # Tenta usar o cérebro (Ollama) para um cumprimento, senão usa fixo
+    try:
+        ctx = "hungry" if state["hunger"] < 30 else "greeting"
+        prompt = f"Você é uma capivara terminal. Seu humor é {mood}. Status: {state}. Gere um cumprimento fofo e curto (máx 10 palavras) em português."
+        speech = ollama_ask(prompt, timeout=2, spin=False) or "Oink! Tudo certo por aqui!"
+        GREETING_CACHE.write_text(f"{mini} {speech}")
+        PROMPT_CACHE.write_text(f"{mini}nv{state['level']}{emoji}")
+    except Exception:
+        GREETING_CACHE.write_text(f"{mini} Oink! Tudo certo!")
+        PROMPT_CACHE.write_text(f"{mini}nv{state['level']}{emoji}")
+
 def apply_decay(state):
     last = datetime.fromisoformat(state["last_seen"])
     now = datetime.now()
     hours = (now - last).total_seconds() / 3600
 
+    # Dificuldade removida a pedido do usuário: foco agora é em Skills
     state["hunger"] = max(0, state["hunger"] - DECAY_PER_HOUR["hunger"] * hours)
     state["happiness"] = max(0, state["happiness"] - DECAY_PER_HOUR["happiness"] * hours)
 
-    # Energia: noite (22h-6h) recupera, dia drena — contado hora a hora,
-    # não pela hora atual (senão a noite inteira era ignorada)
     state["energy"] = max(0, min(100, state["energy"] + _energy_delta(last, now)))
 
     state["last_seen"] = now.isoformat()
     born = datetime.fromisoformat(state["born"])
     state["age_days"] = (now - born).days
 
-    # Drain XP accumulated by shell preexec hook
+    if "skills" not in state:
+        state["skills"] = {}
+
+    # Drain XP e processa Skills do log de comandos
     try:
+        # XP Global
         if XP_PENDING.exists():
             pending = int(XP_PENDING.read_text().strip() or "0")
             if pending > 0:
                 state["xp"] += pending
                 XP_PENDING.write_text("0")
+        
+        # Skills Individuais
+        if CMD_PENDING.exists():
+            cmds = CMD_PENDING.read_text().splitlines()
+            for cmd in cmds:
+                skill_name = SKILL_MAP.get(cmd)
+                if skill_name:
+                    if skill_name not in state["skills"]:
+                        state["skills"][skill_name] = {"xp": 0, "level": 1}
+                    
+                    state["skills"][skill_name]["xp"] += 10 # 10 XP por uso de comando
+                    check_skill_levelup(state, skill_name)
+            
+            CMD_PENDING.write_text("") # Limpa o log
     except Exception:
         pass
 
     return state
 
+def check_skill_levelup(state, skill_name):
+    s = state["skills"][skill_name]
+    # Mesma fórmula quadrática: Nível = sqrt(XP/25) + 1
+    new_level = int((s["xp"] / 25)**0.5) + 1
+    if new_level > s["level"]:
+        s["level"] = new_level
+        msg = f"✨ SKILL UP! {state['name']} melhorou em {skill_name} (Nível {new_level})! ✨"
+        if RICH:
+            console.print(f"\n[bold cyan]{msg}[/bold cyan]")
+        else:
+            print(f"\n{msg}")
 
 def check_levelup(state):
-    new_level = (state["xp"] // 100) + 1
+    # Progressão não linear: exige mais XP a cada nível
+    # Lvl 1: 0 XP, Lvl 2: 25 XP, Lvl 3: 100 XP, Lvl 4: 225 XP, Lvl 5: 400 XP...
+    # Fórmula: Nível = floor(sqrt(XP / 25)) + 1
+    new_level = int((state["xp"] / 25)**0.5) + 1
     if new_level > state["level"]:
         state["level"] = new_level
         msg = f"★ NÍVEL UP! {state['name']} chegou ao nível {new_level}! ★"
@@ -195,6 +290,7 @@ def check_levelup(state):
             console.print(f"\n[bold yellow]{msg}[/bold yellow]")
         else:
             print(f"\n{msg}")
+
 
 
 def _spin(stop_event):
@@ -329,6 +425,9 @@ def cmd_status(state):
     stage = get_stage(state.get("age_days", 0))
     mood, emoji = get_mood(state)
     art = ASCII_ARTS[stage]
+    title, skill_emoji = get_skill_title_and_emoji(state)
+    if skill_emoji:
+        emoji = skill_emoji
 
     if RICH:
         from rich.markup import escape
@@ -337,12 +436,26 @@ def cmd_status(state):
         e_color = status_color(state["energy"])
 
         stats = (
-            f"\n[bold]{state['name']}[/bold] — {stage} — {state.get('age_days', 0)} dias\n"
+            f"\n[bold]{state['name']}[/bold] — [cyan]{title}[/cyan]\n"
+            f"{stage} — {state.get('age_days', 0)} dias\n"
             f"Humor: {emoji} {mood} | Nível {state['level']} (XP {state['xp']})\n\n"
             f"🌿 Fome       [{h_color}]{bar(state['hunger'])}[/{h_color}] {state['hunger']:.0f}%\n"
             f"💛 Felicidade [{p_color}]{bar(state['happiness'])}[/{p_color}] {state['happiness']:.0f}%\n"
             f"⚡ Energia    [{e_color}]{bar(state['energy'])}[/{e_color}] {state['energy']:.0f}%\n"
         )
+        
+        if state.get("skills"):
+            stats += "\n[bold cyan]Skills:[/bold cyan]\n"
+            for sname, sdata in state["skills"].items():
+                # Calcula progresso para o próximo nível da skill
+                # XP_atual = 25 * (Lvl-1)^2
+                # XP_prox = 25 * Lvl^2
+                lvl = sdata["level"]
+                xp_base = 25 * (lvl - 1)**2
+                xp_next = 25 * lvl**2
+                progress = 100 * (sdata["xp"] - xp_base) / (xp_next - xp_base) if xp_next > xp_base else 100
+                stats += f"{sname:<12} [cyan]{bar(progress, 10)}[/cyan] Nv.{lvl}\n"
+
         console.print(Panel(
             f"[yellow]{escape(art)}[/yellow]\n{stats}",
             title="[bold green]🐾 CapivaraCLI[/bold green]",
@@ -355,6 +468,10 @@ def cmd_status(state):
         print(f"💛 Felicidade: [{bar(state['happiness'])}] {state['happiness']:.0f}%")
         print(f"⚡ Energia:    [{bar(state['energy'])}] {state['energy']:.0f}%")
         print(f"Nível: {state['level']} | XP: {state['xp']}")
+        if state.get("skills"):
+            print("\nSkills:")
+            for sname, sdata in state["skills"].items():
+                print(f"- {sname}: Nv.{sdata['level']}")
 
 
 def cmd_feed(state):
