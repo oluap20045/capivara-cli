@@ -58,6 +58,8 @@ Bônus: vem com um arsenal de comandos de **info & segurança** — clima, monit
 | `tshark` (wireshark-cli) | opcional | detecção de ARP spoofing no `scan` |
 | zsh | opcional | integração de prompt/XP automática |
 
+> **Linux & macOS** — roda nos dois. No macOS os comandos de sistema/rede usam as ferramentas BSD nativas (`sysctl`, `vm_stat`, `ifconfig`, `lsof`, `scutil`, `route`, `socketfilterfw`); `nmap`/`tshark` instalam via `brew install nmap wireshark`. O tamagotchi e o `clima` funcionam 100% nas duas plataformas.
+
 ## 🚀 Instalação
 
 ```bash

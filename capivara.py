@@ -26,6 +26,8 @@ OLLAMA_MODEL = "llama3.1:8b"
 
 DECAY_PER_HOUR = {"hunger": 5, "happiness": 2, "energy": 3}
 
+IS_MAC = sys.platform == "darwin"
+
 STAGES = [(0, "filhote"), (7, "jovem"), (30, "adulto"), (180, "anciao")]
 
 ASCII_ARTS = {
@@ -558,6 +560,24 @@ def cmd_new(state):
 
 def _get_active_iface():
     """Returns (iface, local_ip, gateway, subnet_cidr) from default route."""
+    if IS_MAC:
+        route = _run(["route", "-n", "get", "default"])
+        im = re.search(r'interface:\s*(\S+)', route)
+        gm = re.search(r'gateway:\s*(\S+)', route)
+        iface = im.group(1) if im else None
+        gw = gm.group(1) if gm else None
+        if not iface:
+            return None, None, None, None
+        ifc = _run(["ifconfig", iface])
+        m = re.search(r'inet (\d+\.\d+\.\d+\.\d+) netmask (0x[0-9a-fA-F]+)', ifc)
+        if m:
+            local_ip = m.group(1)
+            mask = int(m.group(2), 16)
+            prefix = bin(mask).count("1")
+            parts = [int(x) for x in local_ip.split(".")]
+            net = ".".join(str(parts[i] & ((mask >> (8 * (3 - i))) & 0xFF)) for i in range(4))
+            return iface, local_ip, gw, f"{net}/{prefix}"
+        return iface, None, gw, None
     route = _run(["ip", "route", "show", "default"])
     iface = re.search(r'dev (\S+)', route)
     gw    = re.search(r'via (\S+)', route)
@@ -589,6 +609,132 @@ def _run(cmd, timeout=5):
         return r.stdout.strip()
     except Exception:
         return ""
+
+
+# ─── Cross-platform helpers (Linux + macOS) ──────────────────────────────────
+
+def _cpu_load():
+    """(l1, l5, l15, cores) — os.getloadavg funciona em Linux e macOS."""
+    try:
+        l1, l5, l15 = os.getloadavg()
+        return l1, l5, l15, (os.cpu_count() or 1)
+    except Exception:
+        return None
+
+
+def _mem_info():
+    """(used_mb, total_mb) — Linux via /proc, macOS via sysctl + vm_stat."""
+    if IS_MAC:
+        try:
+            total = int(_run(["sysctl", "-n", "hw.memsize"]))
+            vm = _run(["vm_stat"])
+            page = 4096
+            pm = re.search(r'page size of (\d+) bytes', vm)
+            if pm:
+                page = int(pm.group(1))
+            def pages(key):
+                m = re.search(rf'{key}:\s+(\d+)', vm)
+                return int(m.group(1)) if m else 0
+            free = (pages("Pages free") + pages("Pages inactive")
+                    + pages("Pages speculative")) * page
+            used = total - free
+            return used // (1024 * 1024), total // (1024 * 1024)
+        except Exception:
+            return None
+    try:
+        mem = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, v = line.split(":", 1)
+            mem[k.strip()] = int(v.strip().split()[0])
+        total = mem["MemTotal"] // 1024
+        avail = mem["MemAvailable"] // 1024
+        return total - avail, total
+    except Exception:
+        return None
+
+
+def _default_gateway():
+    if IS_MAC:
+        m = re.search(r'gateway:\s*(\S+)', _run(["route", "-n", "get", "default"]))
+        return m.group(1) if m else ""
+    r = _run(["ip", "route", "show", "default"])
+    return r.splitlines()[0] if r else ""
+
+
+def _get_ifaces():
+    """Lista de dicts {ifname, operstate, addr_info:[{local, family}]}."""
+    if IS_MAC:
+        data = _run(["ifconfig"])
+        ifaces, cur = [], None
+        for line in data.splitlines():
+            if not line.startswith((" ", "\t")):
+                if cur:
+                    ifaces.append(cur)
+                fm = re.search(r'<([^>]*)>', line)
+                flags = fm.group(1) if fm else ""
+                cur = {"ifname": line.split(":")[0],
+                       "operstate": "UP" if "UP" in flags else "DOWN",
+                       "addr_info": []}
+            elif cur is not None:
+                ip4 = re.search(r'inet (\d+\.\d+\.\d+\.\d+)', line)
+                if ip4:
+                    cur["addr_info"].append({"local": ip4.group(1), "family": "inet"})
+                if "status: active" in line:
+                    cur["operstate"] = "UP"
+        if cur:
+            ifaces.append(cur)
+        return ifaces
+    ip_json = _run(["ip", "-j", "addr"])
+    return json.loads(ip_json) if ip_json else []
+
+
+def _dns_servers():
+    if IS_MAC:
+        out = _run(["scutil", "--dns"])
+        servers, seen = [], set()
+        for s in re.findall(r'nameserver\[\d+\]\s*:\s*(\S+)', out):
+            if s not in seen:
+                seen.add(s)
+                servers.append(s)
+        return servers
+    try:
+        resolv = Path("/etc/resolv.conf").read_text()
+        return [l.split()[1] for l in resolv.splitlines() if l.startswith("nameserver")]
+    except Exception:
+        return []
+
+
+def _ping(host):
+    flag = "-t" if IS_MAC else "-W"   # macOS -t = timeout(s); Linux -W = wait(s)
+    return _run(["ping", "-c", "1", flag, "2", host], timeout=4)
+
+
+def _listening_ports():
+    """[(port, proc_name)] — Linux ss, macOS lsof."""
+    seen = {}
+    if IS_MAC:
+        out = _run(["lsof", "-nP", "-iTCP", "-sTCP:LISTEN"])
+        for row in out.splitlines()[1:]:
+            parts = row.split()
+            if len(parts) < 9:
+                continue
+            port = parts[8].rsplit(":", 1)[-1]
+            if port.isdigit() and port not in seen:
+                seen[port] = parts[0]
+    else:
+        out = _run(["ss", "-tlnp"])
+        for row in out.splitlines()[1:]:
+            parts = row.split()
+            if len(parts) >= 4:
+                local = parts[3]
+                proc  = parts[6] if len(parts) > 6 else ""
+                port  = local.rsplit(":", 1)[-1] if ":" in local else local
+                if not port.isdigit():
+                    continue
+                nm = re.search(r'"(.+?)"', proc)
+                if port not in seen:
+                    seen[port] = nm.group(1) if nm else "?"
+    return list(seen.items())
 
 
 def cmd_clima(_state=None):
@@ -657,29 +803,23 @@ def cmd_tech(_state=None):
     lines = []
 
     # CPU load
-    try:
-        load = Path("/proc/loadavg").read_text().split()
-        l1, l5, l15 = load[0], load[1], load[2]
-        cores = os.cpu_count() or 1
-        pct = float(l1) / cores * 100
+    load = _cpu_load()
+    if load:
+        l1, l5, l15, cores = load
+        pct = l1 / cores * 100
         color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
-        lines.append(f"[bold]CPU[/bold]  load {l1} / {l5} / {l15}  [{color}]{pct:.0f}%[/{color}] ({cores} cores)")
-    except Exception:
+        lines.append(f"[bold]CPU[/bold]  load {l1:.2f} / {l5:.2f} / {l15:.2f}  [{color}]{pct:.0f}%[/{color}] ({cores} cores)")
+    else:
         lines.append("CPU  n/a")
 
     # RAM
-    try:
-        mem = {}
-        for line in Path("/proc/meminfo").read_text().splitlines():
-            k, v = line.split(":", 1)
-            mem[k.strip()] = int(v.strip().split()[0])
-        total = mem["MemTotal"] // 1024
-        avail = mem["MemAvailable"] // 1024
-        used  = total - avail
-        pct   = used / total * 100
+    mi = _mem_info()
+    if mi:
+        used, total = mi
+        pct = used / total * 100 if total else 0
         color = "green" if pct < 60 else "yellow" if pct < 85 else "red"
         lines.append(f"[bold]RAM[/bold]  {used} / {total} MB  [{color}]{pct:.0f}%[/{color}]")
-    except Exception:
+    else:
         lines.append("RAM  n/a")
 
     # Disk
@@ -733,9 +873,8 @@ def cmd_net(_state=None):
     # Interfaces + VPN detection
     vpn_ifaces = []
     try:
-        ip_json = _run(["ip", "-j", "addr"])
-        ifaces = json.loads(ip_json) if ip_json else []
-        vpn_keywords = {"tun", "wg", "vpn", "ppp", "tap", "nordlynx", "proton"}
+        ifaces = _get_ifaces()
+        vpn_keywords = {"tun", "wg", "vpn", "ppp", "tap", "nordlynx", "proton", "utun", "ipsec"}
         skip_prefixes = {"veth", "br-"}  # Docker internals — mostrar só contagem
         lines.append("[bold]Interfaces:[/bold]")
         veth_count = 0
@@ -767,9 +906,9 @@ def cmd_net(_state=None):
         lines.append("\n[dim]VPN: não detectada[/dim]")
 
     # Default gateway
-    gw = _run(["ip", "route", "show", "default"])
+    gw = _default_gateway()
     if gw:
-        lines.append(f"[bold]Gateway:[/bold] {gw.splitlines()[0]}")
+        lines.append(f"[bold]Gateway:[/bold] {gw}")
 
     # Public IP (com timeout curto)
     lines.append("")
@@ -782,15 +921,12 @@ def cmd_net(_state=None):
         lines.append("[bold]IP Público:[/bold]  [dim]timeout[/dim]")
 
     # DNS
-    try:
-        resolv = Path("/etc/resolv.conf").read_text()
-        dns = [l.split()[1] for l in resolv.splitlines() if l.startswith("nameserver")]
+    dns = _dns_servers()
+    if dns:
         lines.append(f"[bold]DNS:[/bold]         {', '.join(dns)}")
-    except Exception:
-        pass
 
     # Ping google
-    ping = _run(["ping", "-c", "1", "-W", "2", "8.8.8.8"], timeout=4)
+    ping = _ping("8.8.8.8")
     if "time=" in ping:
         ms = re.search(r"time=([\d.]+)", ping)
         latency = ms.group(1) if ms else "?"
@@ -809,23 +945,9 @@ def cmd_net(_state=None):
 def cmd_hacker(_state=None):
     lines = []
 
-    # Portas abertas (ss -tlnp)
-    ss_out = _run(["ss", "-tlnp"])
-    if ss_out:
-        seen = {}
-        for row in ss_out.splitlines()[1:]:
-            parts = row.split()
-            if len(parts) >= 4:
-                local = parts[3]
-                proc  = parts[6] if len(parts) > 6 else ""
-                port  = local.rsplit(":", 1)[-1] if ":" in local else local
-                if not port.isdigit():
-                    continue
-                name = re.search(r'\"(.+?)\"', proc)
-                pname = name.group(1) if name else "?"
-                if port not in seen:
-                    seen[port] = pname
-        ports = list(seen.items())
+    # Portas abertas (Linux ss / macOS lsof)
+    ports = _listening_ports()
+    if ports:
         lines.append(f"[bold]🔌 Portas abertas ({len(ports)}):[/bold]")
         known_ports = {
             "22": "SSH", "80": "HTTP", "443": "HTTPS", "3306": "MySQL",
@@ -839,7 +961,7 @@ def cmd_hacker(_state=None):
             label = f"[dim]{known}[/dim]" if known else ""
             lines.append(f"  :{port}  {name}  {label}")
     else:
-        lines.append("[dim]ss não disponível[/dim]")
+        lines.append("[dim]Nenhuma porta TCP em escuta (ou ss/lsof ausente)[/dim]")
 
     # SUID binários não-padrão
     lines.append("")
@@ -880,8 +1002,12 @@ def cmd_hacker(_state=None):
 
     # Firewall
     lines.append("")
-    ufw = _run(["ufw", "status"], timeout=3)
-    if ufw:
+    if IS_MAC:
+        fw = _run(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"], timeout=3)
+        on = "enabled" in fw.lower() or "state = 1" in fw.lower()
+        c = "green" if on else "red"
+        lines.append(f"[bold]🛡️  Firewall (app):[/bold] [{c}]{'ativo' if on else 'inativo'}[/{c}]")
+    elif (ufw := _run(["ufw", "status"], timeout=3)):
         status = "ativo" if "active" in ufw.lower() else "inativo"
         color = "green" if status == "ativo" else "red"
         lines.append(f"[bold]🛡️  Firewall (ufw):[/bold] [{color}]{status}[/{color}]")
@@ -895,8 +1021,13 @@ def cmd_hacker(_state=None):
             lines.append("[bold]🛡️  Firewall:[/bold] [dim]não detectado[/dim]")
 
     # World-writable em /etc
-    ww = _run(["find", "/etc", "-maxdepth", "2", "-writable", "-not", "-user", "root",
-               "-not", "-type", "l"], timeout=6)
+    if IS_MAC:
+        # BSD find não tem -writable; checa world-writable (-perm -0002)
+        ww = _run(["find", "/etc/", "-maxdepth", "2", "-perm", "-0002",
+                   "-not", "-type", "l"], timeout=6)
+    else:
+        ww = _run(["find", "/etc", "-maxdepth", "2", "-writable", "-not", "-user", "root",
+                   "-not", "-type", "l"], timeout=6)
     if ww:
         lines.append(f"\n[bold]⚠️  Arquivos /etc graváveis por não-root:[/bold]")
         for f in ww.splitlines()[:5]:
